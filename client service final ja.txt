@@ -1,0 +1,181 @@
+package com.demo.bankapp.service;
+
+import com.demo.bankapp.entity.ClientTransaction;
+import com.demo.bankapp.model.ClientMessage;
+import com.demo.bankapp.repository.ClientMessageRepository;
+import com.demo.bankapp.repository.ClientTransactionRepository;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import jakarta.transaction.Transactional;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jms.core.JmsTemplate;
+import org.springframework.stereotype.Service;
+
+import java.io.FileWriter;
+import java.io.PrintWriter;
+import java.time.LocalDateTime;
+import java.util.Optional;
+import java.util.Random;
+import java.util.UUID;
+import java.util.concurrent.*;
+
+@Slf4j
+@Service
+public class ClientService {
+
+    private final ClientMessageRepository clientMessageRepository;
+    private final ClientTransactionRepository clientTransactionRepository;
+    private final JmsTemplate jmsTemplate;
+
+    private ExecutorService executor;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final Random random = new Random();
+
+    private static final Long ADD_CREDIT = 10000L;
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    @Value("${dlq.queue.name:client-message.dlq}")
+    private String dlqQueueName;
+
+    @Value("${service.retry.max:3}")
+    private int maxRetries;
+
+    @Value("${service.retry.base-delay:200}")
+    private long baseRetryDelayMs;
+
+    public ClientService(ClientMessageRepository clientMessageRepository,
+                         ClientTransactionRepository clientTransactionRepository,
+                         JmsTemplate jmsTemplate) {
+        this.clientMessageRepository = clientMessageRepository;
+        this.clientTransactionRepository = clientTransactionRepository;
+        this.jmsTemplate = jmsTemplate;
+    }
+
+    @PostConstruct
+    public void initExecutor() {
+        int cores = Runtime.getRuntime().availableProcessors();
+        executor = new ThreadPoolExecutor(
+                cores * 2,
+                cores * 4,
+                60, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(20000),
+                new ThreadPoolExecutor.CallerRunsPolicy()
+        );
+        log.info("🚀 ThreadPool initialized: core={}, max={}", cores * 2, cores * 4);
+    }
+
+    public void processMessage(ClientMessage message) {
+        // 🧾 Correlation ID for tracing
+        String correlationId = UUID.randomUUID().toString();
+        message.setCorrelationId(correlationId);
+
+        CompletableFuture
+                .runAsync(() -> safeProcessWithRetry(message), executor)
+                .orTimeout(10, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    log.error("❌ Async failure (correlationId={}): {}", correlationId, ex.getMessage(), ex);
+                    sendToDeadLetterQueue(message);
+                    return null;
+                });
+    }
+
+    /**
+     * Safe retry-aware processing with idempotency and transactional safety
+     */
+    @Transactional
+    protected void safeProcessWithRetry(ClientMessage message) {
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                log.info("🔁 Attempt {}/{} for ID={} Correlation={}", attempt, maxRetries, message.getClientId(), message.getCorrelationId());
+
+                // 🛡️ Idempotency check
+                if (clientMessageRepository.existsById(message.getClientId())) {
+                    log.warn("🟡 Skipping duplicate message ID={} (already processed)", message.getClientId());
+                    return;
+                }
+
+                // ✨ Enrichment logic
+                if (message.getClientName() == null || message.getClientName().isBlank()) {
+                    message.setClientName("Anonymous Client");
+                }
+
+                if ("Institution".equalsIgnoreCase(message.getClientName())) {
+                    message.setClientCredit(message.getClientCredit() + 1000);
+                }
+
+                message.setLastUpdated(LocalDateTime.now());
+
+                // 💾 Save enriched message
+                clientMessageRepository.save(message);
+                log.info("✅ ClientMessage saved: ID={} Correlation={}", message.getClientId(), message.getCorrelationId());
+
+                // 🔁 Update related transaction
+                Optional<ClientTransaction> optionalTx = clientTransactionRepository.findById(message.getClientId());
+                if (optionalTx.isPresent()) {
+                    ClientTransaction clientTx = optionalTx.get();
+                    clientTx.setClientCredit(clientTx.getClientCredit() + ADD_CREDIT);
+                    clientTransactionRepository.save(clientTx);
+                    log.info("💳 Transaction updated: ID={} Credit+{}", clientTx.getClientId(), ADD_CREDIT);
+                } else {
+                    log.warn("⚠️ No transaction found for ID={}", message.getClientId());
+                }
+
+                return; // ✅ Success, exit
+
+            } catch (Exception ex) {
+                log.error("❗ Failure attempt {}/{} for ID={} - {}", attempt, maxRetries, message.getClientId(), ex.getMessage(), ex);
+
+                try {
+                    long jitter = random.nextInt(100);
+                    Thread.sleep(baseRetryDelayMs * attempt + jitter);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        // ❌ Max retries exhausted
+        log.error("☠️ All retries failed. Sending to DLQ. ID={} Correlation={}", message.getClientId(), message.getCorrelationId());
+        sendToDeadLetterQueue(message);
+    }
+
+    /**
+     * Dead Letter Queue fallback with backup storage
+     */
+    private void sendToDeadLetterQueue(ClientMessage message) {
+        try {
+            String json = objectMapper.writeValueAsString(message);
+            jmsTemplate.convertAndSend(dlqQueueName, json);
+            log.warn("📤 Sent to DLQ [{}] - Correlation={} Message={}", dlqQueueName, message.getCorrelationId(), json);
+        } catch (Exception ex) {
+            log.error("💥 Failed to send to DLQ: {}", ex.getMessage(), ex);
+            persistToFallbackFile(message);
+        }
+    }
+
+    /**
+     * Backup local file store for critical DLQ failures
+     */
+    private void persistToFallbackFile(ClientMessage message) {
+        try (PrintWriter out = new PrintWriter(new FileWriter("failed-messages-backup.txt", true))) {
+            out.println(objectMapper.writeValueAsString(message));
+            log.warn("🗃️ Message persisted to fallback file: ID={} Correlation={}", message.getClientId(), message.getCorrelationId());
+        } catch (Exception e) {
+            log.error("🔥 CRITICAL: Failed to persist to fallback file: {}", e.getMessage(), e);
+        }
+    }
+
+    // Reserved for future
+    public Object getClientName(Long clientId) {
+        return null;
+    }
+
+    public Object findMessageByClientId(Long clientId) {
+        return null;
+    }
+}
