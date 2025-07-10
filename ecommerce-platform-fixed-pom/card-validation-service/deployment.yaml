@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: card-validation-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: card-validation-service
+  template:
+    metadata:
+      labels:
+        app: card-validation-service
+    spec:
+      containers:
+        - name: card-validation-service
+          image: card-validation-service:latest
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: card-validation-service
+spec:
+  selector:
+    app: card-validation-service
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
